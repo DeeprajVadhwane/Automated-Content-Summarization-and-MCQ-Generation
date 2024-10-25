@@ -1,87 +1,74 @@
+import validators
 import streamlit as st
-import torch
-from transformers import Wav2Vec2ForCTC, Wav2Vec2Tokenizer, BartTokenizer, BartForConditionalGeneration, GPT2Tokenizer, GPT2LMHeadModel
-import moviepy.editor as mp
-import librosa
-import tempfile
 import os
+from langchain.prompts import PromptTemplate
+from langchain_groq import ChatGroq
+from langchain.chains.summarize import load_summarize_chain
+from langchain_community.document_loaders import YoutubeLoader, UnstructuredURLLoader
 
-st.title("AI-Powered MCQ Generator from Video")
+## Streamlit APP
+st.set_page_config(page_title="LangChain: Summarize Text From YT or Website", page_icon="🦜")
+st.title("🦜 LangChain: Summarize Text From YT or Website")
+st.subheader('Summarize URL')
 
-# File uploader for video
-uploaded_file = st.file_uploader("Upload a video", type=["mp4", "avi", "move"])
+## Get the Groq API Key and URL (YT or website) to be summarized
+with st.sidebar:
+    groq_api_key = st.text_input("Groq API Key", value="", type="password")
+
+generic_url = st.text_input("Enter URL (YouTube or Website)", label_visibility="collapsed")
+
+# Language selection for transcripts
+language_options = {
+    "en": "English",
+    "hi": "Hindi",
+    # Add more languages as needed
+}
+
+selected_language = st.selectbox("Select Transcript Language", options=list(language_options.keys()), format_func=lambda x: language_options[x])
 
 
-if uploaded_file is not None:
-    # Save the uploaded video to a temporary file
-    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-        tmp_file.write(uploaded_file.read())
-        video_path = tmp_file.name + ".mp4"
+## Check if the API key is provided
+if not groq_api_key.strip():
+    st.error("Please enter your Groq API Key.")
+else:
+    # Optionally set as an environment variable (or pass it directly)
+    os.environ["GROQ_API_KEY"] = groq_api_key
 
-    # Extract audio from the video using moviepy
-    st.write("Extracting audio from the video...")
-    video = mp.VideoFileClip(video_path)
-    audio_path = tempfile.mktemp(suffix=".wav")
-    video.audio.write_audiofile(audio_path)
+    # Initialize the model
+    llm = ChatGroq(model="Gemma-7b-It", groq_api_key=groq_api_key)
 
-    st.write("Audio extracted successfully!")
+    prompt_template = """
+    Provide a summary of the following content in 1000 words try to analyze in depth and provide:
+    Content:{text}
+    """
+    prompt = PromptTemplate(template=prompt_template, input_variables=["text"])
 
-def transcribe_audio(audio_path):
-    st.write("Transcribing audio to text...")
+    if st.button("Summarize the Content from YT or Website"):
+        ## Validate all the inputs
+        if not generic_url.strip():
+            st.error("Please provide a valid URL.")
+        elif not validators.url(generic_url):
+            st.error("Please enter a valid URL. It can be a YouTube video URL or a website URL.")
+        else:
+            try:
+                with st.spinner("Loading content..."):
+                    ## Loading the website or YouTube video data
+                    if "youtube.com" in generic_url:
+                        loader = YoutubeLoader.from_youtube_url(generic_url, add_video_info=True,language = [selected_language])
+                    else:
+                        loader = UnstructuredURLLoader(
+                            urls=[generic_url],
+                            ssl_verify=False,
+                            headers={"User-Agent": "Mozilla/5.0"}
+                        )
+                    
+                    docs = loader.load()
 
-    # Load Wav2Vec2 model and tokenizer
-    tokenizer = Wav2Vec2Tokenizer.from_pretrained("facebook/wav2vec2-base-960h")
-    model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-base-960h")
+                    ## Chain for Summarization
+                    chain = load_summarize_chain(llm, chain_type="stuff", prompt=prompt)
+                    output_summary = chain.run(docs)
 
-    # Load audio file using librosa
-    audio_input, _ = librosa.load(audio_path, sr=16000)
-    input_values = tokenizer(audio_input, return_tensors="pt").input_values
+                    st.success(output_summary)
 
-    # Perform transcription
-    with torch.no_grad():
-        logits = model(input_values).logits
-
-    predicted_ids = torch.argmax(logits, dim=-1)
-    transcription = tokenizer.decode(predicted_ids[0])
-    return transcription
-
-if uploaded_file is not None:
-    transcription = transcribe_audio(audio_path)
-    st.write("Transcription:", transcription)
-
-def summarize_text(text):
-    st.write("Summarizing transcription...")
-
-    # Load BART model and tokenizer
-    tokenizer = BartTokenizer.from_pretrained("facebook/bart-large-cnn")
-    model = BartForConditionalGeneration.from_pretrained("facebook/bart-large-cnn")
-
-    inputs = tokenizer([text], max_length=1024, return_tensors="pt", truncation=True)
-    summary_ids = model.generate(inputs["input_ids"], max_length=150, min_length=30, length_penalty=2.0, num_beams=4, early_stopping=True)
-    
-    summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
-    return summary
-
-if uploaded_file is not None:
-    summary = summarize_text(transcription)
-    st.write("Summary:", summary)
-
-def generate_question(summary):
-    st.write("Generating a multiple-choice question...")
-
-    # Load GPT-2 model and tokenizer
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    model = GPT2LMHeadModel.from_pretrained("gpt2")
-
-    # Format the input for the model
-    prompt = f"Generate a multiple-choice question based on the following summary: {summary}\n"
-    inputs = tokenizer.encode(prompt, return_tensors="pt")
-
-    # Generate the question
-    outputs = model.generate(inputs, max_length=150, num_return_sequences=1, no_repeat_ngram_size=2, early_stopping=True)
-    question = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return question
-
-if uploaded_file is not None:
-    question = generate_question(summary)
-    st.write("Generated MCQ:", question)
+            except Exception as e:
+                st.error(f"An error occurred: {str(e)}")
